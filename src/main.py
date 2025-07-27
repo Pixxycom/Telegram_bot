@@ -1,12 +1,12 @@
-import os
+ import os
 import time
 import threading
 import requests
 from flask import Flask, request
 import telebot
 
-BOT_TOKEN = "7372191426:AAFGc0Ex7EjQXRMCeKiacvmcT9n_N7dOOm0"
-CHAT_ID = "6301144768"
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # ✅ Secure: Token comes from environment
+CHAT_ID = "6301144768"  # You can keep this hardcoded
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -78,7 +78,7 @@ def analyze_coin(coin):
         entry = current_price
         sl = support * 0.98
         risk = entry - sl
-        tp = entry + risk * 1.2  # 1:1.2 risk-reward ratio
+        tp = entry + risk * 1.2
         return {
             "type": "LONG",
             "coin": coin,
@@ -91,7 +91,7 @@ def analyze_coin(coin):
         entry = current_price
         sl = resistance * 1.02
         risk = sl - entry
-        tp = entry - risk * 2.5  # 1:2.5 risk-reward ratio
+        tp = entry - risk * 2.5
         return {
             "type": "SHORT",
             "coin": coin,
