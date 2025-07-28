@@ -1,160 +1,95 @@
-import os
-import time
-import threading
+  import os
 import requests
-from flask import Flask, request
-import telebot
+import time
+from datetime import datetime
+import ta
+import pandas as pd
+from dotenv import load_dotenv
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ✅ Secure: Token comes from environment
-CHAT_ID = "6301144768"  # You can keep this hardcoded
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
-PORT = int(os.environ.get("PORT", 5000))
+load_dotenv()  # Load environment variables from .env file
 
-COINS = ["bitcoin", "ethereum", "binancecoin", "solana", "ripple"]
-TIMEFRAMES = {"15m": 15, "1h": 60}
+# Get your Telegram bot token and chat ID from environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+# List of crypto pairs to monitor
+PAIRS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
+TIMEFRAME = '1h'
+LIMIT = 150
 
-last_signal_time = {}
-
-def fetch_price(coin_id):
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+# Define your CoinGecko or Binance API endpoint for Kline data
+def get_klines(symbol, interval, limit):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        return data[coin_id]["usd"]
+        response = requests.get(url)
+        data = response.json()
+        df = pd.DataFrame(data, columns=[
+            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_asset_volume', 'number_of_trades',
+            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
+        ])
+        df['close'] = df['close'].astype(float)
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        return df
     except Exception as e:
-        print(f"Error fetching price for {coin_id}: {e}")
+        print(f"Error fetching {symbol}: {e}")
         return None
 
-def fetch_price_history(coin_id):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
-    try:
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        prices = data.get("prices", [])
-        return prices
-    except Exception as e:
-        print(f"Error fetching price history for {coin_id}: {e}")
-        return []
-
-def detect_order_block(prices):
-    if len(prices) < 3:
-        return None
-    p1, p2, p3 = prices[-3][1], prices[-2][1], prices[-1][1]
-    if p2 < p1 and p2 < p3:
-        return "bullish"
-    elif p2 > p1 and p2 > p3:
-        return "bearish"
-    return None
-
-def detect_support_resistance(prices):
-    vals = [p[1] for p in prices]
-    if not vals:
-        return None, None
-    return min(vals), max(vals)
-
-def analyze_coin(coin):
-    prices = fetch_price_history(coin)
-    if not prices:
+# Detect structure and simple order block logic
+def detect_signal(df):
+    if df is None or len(df) < 50:
         return None
 
-    prices_1h = prices[::4]
-    prices_15m = prices
+    df['ema'] = ta.trend.ema_indicator(df['close'], window=20)
+    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
 
-    ob_1h = detect_order_block(prices_1h)
-    ob_15m = detect_order_block(prices_15m)
-    support, resistance = detect_support_resistance(prices_1h)
-    current_price = fetch_price(coin)
-
-    if not all([ob_1h, ob_15m, support, resistance, current_price]):
-        return None
-
-    if ob_1h != ob_15m:
-        return None
-
-    if ob_1h == "bullish" and current_price <= support * 1.01:
-        entry = current_price
-        sl = support * 0.98
-        risk = entry - sl
-        tp = entry + risk * 1.2
-        return {
-            "type": "LONG",
-            "coin": coin,
-            "entry": entry,
-            "stop_loss": sl,
-            "take_profit": tp,
-        }
-
-    if ob_1h == "bearish" and current_price >= resistance * 0.99:
-        entry = current_price
-        sl = resistance * 1.02
-        risk = sl - entry
-        tp = entry - risk * 2.5
-        return {
-            "type": "SHORT",
-            "coin": coin,
-            "entry": entry,
-            "stop_loss": sl,
-            "take_profit": tp,
-        }
-    return None
-
-def send_signal(signal):
-    coin = signal["coin"].upper()
-    msg = (f"📢 *{signal['type']} Signal for {coin}*\n"
-           f"Entry: ${signal['entry']:.2f}\n"
-           f"Stop Loss: ${signal['stop_loss']:.2f}\n"
-           f"Take Profit: ${signal['take_profit']:.2f}\n"
-           "_Trade carefully and manage risk._")
-    try:
-        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
-        print(f"Signal sent for {coin}")
-    except Exception as e:
-        print(f"Failed to send signal for {coin}: {e}")
-
-def signal_loop():
-    while True:
-        for coin in COINS:
-            key = f"last_signal_{coin}"
-            last_sent = last_signal_time.get(key, 0)
-            if time.time() - last_sent < 1800:
-                continue
-            signal = analyze_coin(coin)
-            if signal:
-                send_signal(signal)
-                last_signal_time[key] = time.time()
-        time.sleep(60)
-
-@bot.message_handler(commands=["start"])
-def start_handler(message):
-    bot.reply_to(message, "Hello! Crypto SMC Bot is online and analyzing market signals.")
-
-@bot.message_handler(commands=["help"])
-def help_handler(message):
-    bot.reply_to(message, "This bot analyzes 5 crypto coins using Smart Money Concepts and sends signals with Entry, Stop Loss, and Take Profit.")
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    json_str = request.get_data().decode("utf-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
-
-@app.route("/")
-def index():
-    return "Crypto SMC Bot is running."
-
-if __name__ == "__main__":
-    bot.remove_webhook()
-    if RENDER_URL:
-        bot.set_webhook(url=f"{RENDER_URL}/{BOT_TOKEN}")
-        print(f"Webhook set to {RENDER_URL}/{BOT_TOKEN}")
+    if df['close'].iloc[-1] > df['ema'].iloc[-1] and df['rsi'].iloc[-1] < 70:
+        return 'BUY'
+    elif df['close'].iloc[-1] < df['ema'].iloc[-1] and df['rsi'].iloc[-1] > 30:
+        return 'SELL'
     else:
-        print("RENDER_EXTERNAL_URL not set, webhook not set")
+        return None
 
-    thread = threading.Thread(target=signal_loop, daemon=True)
-    thread.start()
+# Send signal to Telegram
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': CHAT_ID,
+        'text': message
+    }
+    try:
+        requests.post(url, data=payload)
+    except Exception as e:
+        print(f"Failed to send message: {e}")
 
-    app.run(host="0.0.0.0", port=PORT)
+def run():
+    for pair in PAIRS:
+        df = get_klines(pair, TIMEFRAME, LIMIT)
+        signal = detect_signal(df)
+
+        if signal:
+            entry = df['close'].iloc[-1]
+            sl = round(entry * 0.98, 2) if signal == 'BUY' else round(entry * 1.02, 2)
+            tp = round(entry * 1.05, 2) if signal == 'BUY' else round(entry * 0.95, 2)
+            trend = "UP" if signal == "BUY" else "DOWN"
+
+            message = (
+                f"📊 *SMC SIGNAL*\n"
+                f"Pair: {pair}\n"
+                f"Trend: {trend}\n"
+                f"Signal: {signal}\n"
+                f"Entry: {entry}\n"
+                f"Stop Loss: {sl}\n"
+                f"Take Profit: {tp}\n"
+                f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            )
+            send_telegram_message(message)
+
+# Main loop
+if __name__ == "__main__":
+    while True:
+        run()
+        time.sleep(1800)  # Wait 30 minutes before next scan
