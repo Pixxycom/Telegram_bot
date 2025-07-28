@@ -1,95 +1,99 @@
 import os
 import requests
-import time
-from datetime import datetime
-import ta
 import pandas as pd
+import time
+import telebot
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
-
-# Get your Telegram bot token and chat ID from environment variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Load environment variables
+load_dotenv()
+TELEGRAM_API_KEY = os.getenv("TELEGRAM_API_KEY")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# List of crypto pairs to monitor
-PAIRS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT']
-TIMEFRAME = '1h'
-LIMIT = 150
+bot = telebot.TeleBot(TELEGRAM_API_KEY)
 
-# Define your CoinGecko or Binance API endpoint for Kline data
-def get_klines(symbol, interval, limit):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+# Config
+PAIRS = ["bitcoin", "ethereum", "solana", "cardano", "binancecoin"]
+TIMEFRAME = "1h"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/{}/market_chart?vs_currency=usd&days=2&interval=hourly"
+
+
+def get_price_data(coin_id):
     try:
+        url = COINGECKO_URL.format(coin_id)
         response = requests.get(url)
-        data = response.json()
-        df = pd.DataFrame(data, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'number_of_trades',
-            'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'
-        ])
-        df['close'] = df['close'].astype(float)
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        prices = response.json()["prices"]
+
+        df = pd.DataFrame(prices, columns=["timestamp", "price"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
+        df["price"] = df["price"].astype(float)
         return df
     except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
+        print(f"Error fetching data for {coin_id}: {e}")
         return None
 
-# Detect structure and simple order block logic
-def detect_signal(df):
-    if df is None or len(df) < 50:
-        return None
 
-    df['ema'] = ta.trend.ema_indicator(df['close'], window=20)
-    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+def detect_bos_and_ob(df):
+    df["high"] = df["price"].rolling(window=3).max()
+    df["low"] = df["price"].rolling(window=3).min()
+    df.dropna(inplace=True)
 
-    if df['close'].iloc[-1] > df['ema'].iloc[-1] and df['rsi'].iloc[-1] < 70:
-        return 'BUY'
-    elif df['close'].iloc[-1] < df['ema'].iloc[-1] and df['rsi'].iloc[-1] > 30:
-        return 'SELL'
-    else:
-        return None
+    recent_high = df["high"].iloc[-2]
+    recent_low = df["low"].iloc[-2]
+    current_price = df["price"].iloc[-1]
 
-# Send signal to Telegram
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': message
-    }
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Failed to send message: {e}")
+    # Detect Break of Structure (BOS)
+    bos_up = current_price > recent_high
+    bos_down = current_price < recent_low
 
-def run():
-    for pair in PAIRS:
-        df = get_klines(pair, TIMEFRAME, LIMIT)
-        signal = detect_signal(df)
+    # Determine trend
+    trend = "ranging"
+    if bos_up:
+        trend = "uptrend"
+    elif bos_down:
+        trend = "downtrend"
 
-        if signal:
-            entry = df['close'].iloc[-1]
-            sl = round(entry * 0.98, 2) if signal == 'BUY' else round(entry * 1.02, 2)
-            tp = round(entry * 1.05, 2) if signal == 'BUY' else round(entry * 0.95, 2)
-            trend = "UP" if signal == "BUY" else "DOWN"
+    # Order Block Detection
+    ob_zone = None
+    if trend == "uptrend":
+        ob_zone = df["low"].iloc[-3]
+    elif trend == "downtrend":
+        ob_zone = df["high"].iloc[-3]
 
-            message = (
-                f"📊 *SMC SIGNAL*\n"
-                f"Pair: {pair}\n"
-                f"Trend: {trend}\n"
-                f"Signal: {signal}\n"
-                f"Entry: {entry}\n"
-                f"Stop Loss: {sl}\n"
-                f"Take Profit: {tp}\n"
-                f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-            )
-            send_telegram_message(message)
+    return trend, bos_up or bos_down, ob_zone
 
-# Main loop
+
+def send_signal(coin, trend, ob_zone):
+    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+    message = f"""
+📊 *{coin.upper()} Signal* — {now}
+
+Trend: *{trend.upper()}*
+Order Block Zone: `{ob_zone:.2f}`
+
+_Trade with trend. Avoid ranging markets._
+    """
+    bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
+
+
+def run_bot():
+    for coin in PAIRS:
+        df = get_price_data(coin)
+        if df is None:
+            continue
+
+        trend, bos_detected, ob_zone = detect_bos_and_ob(df)
+
+        if trend != "ranging" and bos_detected and ob_zone:
+            send_signal(coin, trend, ob_zone)
+        else:
+            print(f"No valid structure in {coin} — skipping...")
+
+
 if __name__ == "__main__":
     while True:
-        run()
-        time.sleep(1800)  # Wait 30 minutes before next scan
+        run_bot()
+        print("Waiting 30 mins...")
+        time.sleep(1800)  # Run every 30 minutes
